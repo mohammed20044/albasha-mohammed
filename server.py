@@ -1005,11 +1005,15 @@ async def seed_defaults():
 
 @app.on_event("startup")
 async def on_startup():
-    await db.users.create_index("username", unique=True)
-    await db.inventory.create_index("id", unique=True)
-    await db.sales.create_index("id", unique=True)
-    await db.customers.create_index("id", unique=True)
-    await seed_defaults()
+    try:
+        await db.users.create_index("username", unique=True)
+        await db.inventory.create_index("id", unique=True)
+        await db.sales.create_index("id", unique=True)
+        await db.customers.create_index("id", unique=True)
+        await seed_defaults()
+
+    except Exception as e:
+        print(f"Skipping index creation during startup: {e}")
 
 @app.on_event("shutdown")
 async def on_shutdown():
