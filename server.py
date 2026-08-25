@@ -168,7 +168,7 @@ class MixCreate(BaseModel):
     nicotine_ml: float = 0
     herb_grams: float = 0
     price_per_cig: float
-    cost_per_cig: float = 0.008
+    cost_per_cig: float = 0.018
     herb_price_per_gram: float = 0
     nicotine_item_id: Optional[str] = None
     herb_item_id: Optional[str] = None
@@ -374,13 +374,13 @@ async def active_mix(user: dict = Depends(current_user)):
 
 @api.post("/mixes")
 async def create_mix(data: MixCreate, user: dict = Depends(current_user)):
-    # End previous active mix
-    await db.mixes.update_many({"status": "active"}, {"$set": {"status": "ended", "ended_at": now_utc()}})
-
+    # Validate the new mix first. The current mix must stay active if the
+    # new mix cannot be created (for example, because stock is insufficient).
     nic_cost = 0.0
     herb_cost = 0.0
     nic_id = data.nicotine_item_id
     herb_id = data.herb_item_id
+
     # Auto-detect nicotine/herb items if not provided
     if not nic_id and data.nicotine_ml > 0:
         it = await db.inventory.find_one({"unit": "مل"}, {"_id": 0})
@@ -389,6 +389,8 @@ async def create_mix(data: MixCreate, user: dict = Depends(current_user)):
         it = await db.inventory.find_one({"unit": "جرام"}, {"_id": 0})
         herb_id = it["id"] if it else None
 
+    nic = None
+    herb = None
     if nic_id and data.nicotine_ml > 0:
         nic = await db.inventory.find_one({"id": nic_id}, {"_id": 0})
         if not nic:
@@ -396,7 +398,7 @@ async def create_mix(data: MixCreate, user: dict = Depends(current_user)):
         if nic["quantity"] < data.nicotine_ml:
             raise HTTPException(400, "كمية النيكوتين غير كافية")
         nic_cost = nic["cost_price"] * data.nicotine_ml
-        await db.inventory.update_one({"id": nic_id}, {"$inc": {"quantity": -data.nicotine_ml}})
+
     if herb_id and data.herb_grams > 0:
         herb = await db.inventory.find_one({"id": herb_id}, {"_id": 0})
         if not herb:
@@ -404,6 +406,42 @@ async def create_mix(data: MixCreate, user: dict = Depends(current_user)):
         if herb["quantity"] < data.herb_grams:
             raise HTTPException(400, "كمية العشبة غير كافية")
         herb_cost = herb["cost_price"] * data.herb_grams
+
+    # The business rule is single-active-mix: creating a new mix means the
+    # previous one has finished. Its profit is finalized and transferred to
+    # the main profit reports exactly once at this point.
+    active = await db.mixes.find_one({"status": "active"}, {"_id": 0})
+    if active:
+        await recompute_mix(active)
+        settlement = {
+            "id": str(uuid.uuid4()),
+            "mix_id": active["id"],
+            "mix_number": active.get("mix_number"),
+            "profit": active.get("profit", 0.0),
+            "total_sales": active.get("total_sales", 0.0),
+            "total_cost": active.get("total_cost", 0.0),
+            "created_at": now_utc(),
+        }
+        # Upsert makes the transfer idempotent: a mix can only contribute
+        # one settlement record to the main profit totals.
+        await db.mix_profit_settlements.update_one(
+            {"mix_id": active["id"]},
+            {"$setOnInsert": settlement},
+            upsert=True,
+        )
+        await db.mixes.update_one(
+            {"id": active["id"]},
+            {"$set": {
+                "status": "ended",
+                "ended_at": settlement["created_at"],
+                "profit_transferred_at": settlement["created_at"],
+            }},
+        )
+
+    # Only after validation/finalization do we consume the raw materials.
+    if nic_id and data.nicotine_ml > 0:
+        await db.inventory.update_one({"id": nic_id}, {"$inc": {"quantity": -data.nicotine_ml}})
+    if herb_id and data.herb_grams > 0:
         await db.inventory.update_one({"id": herb_id}, {"$inc": {"quantity": -data.herb_grams}})
 
     last = await db.mixes.find_one({"mix_number": {"$exists": True}}, {"_id": 0}, sort=[("mix_number", -1)])
@@ -428,6 +466,7 @@ async def create_mix(data: MixCreate, user: dict = Depends(current_user)):
         "created_by_role": data.created_by_role or user.get("role"),
         "created_at": now_utc(),
         "ended_at": None,
+        "profit_transferred_at": None,
     }
     await recompute_mix(doc)
     await db.mixes.insert_one(doc)
@@ -600,9 +639,9 @@ async def create_sale(data: SaleCreate, user: dict = Depends(current_user)):
         elif it.is_mix:
             if not active:
                 raise HTTPException(400, "لا توجد خلطة نشطة لبيع سجائر النيكوتين")
-            line_cost = active.get("cost_per_cig", 0) * it.quantity
+            # Mix-cigarette cost/profit is finalized with the mix, not with
+            # the individual sale. The sale still records its revenue.
             subtotal += line
-            cost_total += line_cost
             mix_sold_add += it.quantity
             validated.append({
                 "item_id": "MIX_CIG", "name": MIX_CIG_NAME, "quantity": it.quantity,
@@ -636,7 +675,22 @@ async def create_sale(data: SaleCreate, user: dict = Depends(current_user)):
         }})
 
     total = max(0.0, subtotal - (data.discount or 0))
-    profit = total - cost_total
+
+    # Only non-mix inventory items contribute profit immediately. Revenue
+    # from mix cigarettes is deferred to the mix settlement. If a discount
+    # exists, allocate it proportionally across the invoice lines so the mix
+    # portion does not accidentally become immediate profit.
+    discount = max(0.0, data.discount or 0)
+    mix_sales = sum(it.get("line_total", 0) for it in validated if it.get("is_mix") or it.get("is_herb"))
+    immediate_sales = sum(it.get("line_total", 0) for it in validated if not (it.get("is_mix") or it.get("is_herb")))
+    immediate_discount = (discount * immediate_sales / subtotal) if subtotal > 0 else 0.0
+    immediate_sales_after_discount = max(0.0, immediate_sales - immediate_discount)
+    immediate_cost = sum(
+        it.get("cost_price", 0) * it.get("quantity", 0)
+        for it in validated
+        if not (it.get("is_mix") or it.get("is_herb"))
+    )
+    profit = immediate_sales_after_discount - immediate_cost
     customer_id = await _upsert_customer(data.customer_name, data.customer_phone)
     debt_amount = 0.0
     if data.payment_method == "debt":
@@ -661,7 +715,7 @@ async def create_sale(data: SaleCreate, user: dict = Depends(current_user)):
         "id": str(uuid.uuid4()), "transaction_type": "sale", "customer_id": customer_id,
         "customer_name": data.customer_name, "customer_phone": data.customer_phone,
         "items": validated, "subtotal": subtotal, "discount": data.discount or 0, "total": total,
-        "payment_method": data.payment_method, "debt_amount": debt_amount, "cost_total": cost_total,
+        "payment_method": data.payment_method, "debt_amount": debt_amount, "cost_total": immediate_cost,
         "profit": profit, "mix_number": used_mix,
         "cashier": user["username"], "cashier_name": user.get("display_name"),
         "created_by_role": data.created_by_role or user.get("role"),
@@ -722,6 +776,17 @@ async def refund_sale(sale_id: str, _: dict = Depends(require_owner)):
                     "material_cost": mix["material_cost"], "total_cost": mix["total_cost"],
                     "total_sales": mix["total_sales"], "profit": mix["profit"],
                 }})
+                # If this mix was already finalized, keep its one settlement
+                # record synchronized after a refund so the main profit report
+                # remains correct and does not double-count the refunded sale.
+                await db.mix_profit_settlements.update_one(
+                    {"mix_id": mix["id"]},
+                    {"$set": {
+                        "profit": mix["profit"],
+                        "total_sales": mix["total_sales"],
+                        "total_cost": mix["total_cost"],
+                    }},
+                )
         else:
             await db.inventory.update_one({"id": it["item_id"]}, {"$inc": {"quantity": it.get("quantity", 0)}})
 
@@ -889,6 +954,12 @@ async def profit_report(start: str, end: str, owner: dict = Depends(require_owne
         pm = sale.get("payment_method", "cash")
         ch = channels.setdefault(pm, {"sales": 0.0, "profit": 0.0, "count": 0})
         ch["sales"] += sale.get("total", 0); ch["profit"] += sale.get("profit", 0); ch["count"] += 1
+    # Add finalized mix profits on the date the mix was closed.
+    async for settlement in db.mix_profit_settlements.find(
+        {"created_at": {"$gte": start_dt, "$lt": end_dt}}, {"_id": 0}
+    ):
+        gross += settlement.get("profit", 0)
+
     expenses = 0.0
     async for ex in db.expenses.find({"created_at": {"$gte": start_dt, "$lt": end_dt}}, {"_id": 0}):
         expenses += ex.get("amount", 0)
@@ -922,6 +993,12 @@ async def dashboard_summary(date: Optional[str] = None, user: dict = Depends(cur
         ch["sales"] += s.get("total", 0)
         ch["profit"] += s.get("profit", 0)
         ch["count"] += 1
+
+    # Finalized mix profits are realized on the day the mix is closed.
+    async for settlement in db.mix_profit_settlements.find(
+        {"created_at": {"$gte": start, "$lt": end}}, {"_id": 0}
+    ):
+        gross_profit += settlement.get("profit", 0)
 
     daily_expenses = 0.0
     async for e in db.expenses.find({"created_at": {"$gte": start, "$lt": end}}, {"_id": 0}):
@@ -1005,15 +1082,11 @@ async def seed_defaults():
 
 @app.on_event("startup")
 async def on_startup():
-    try:
-        await db.users.create_index("username", unique=True)
-        await db.inventory.create_index("id", unique=True)
-        await db.sales.create_index("id", unique=True)
-        await db.customers.create_index("id", unique=True)
-        await seed_defaults()
-
-    except Exception as e:
-        print(f"Skipping index creation during startup: {e}")
+    await db.users.create_index("username", unique=True)
+    await db.inventory.create_index("id", unique=True)
+    await db.sales.create_index("id", unique=True)
+    await db.customers.create_index("id", unique=True)
+    await seed_defaults()
 
 @app.on_event("shutdown")
 async def on_shutdown():
